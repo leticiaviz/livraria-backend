@@ -314,57 +314,79 @@ app.get('/api/books-search/external', authenticateToken, async (req, res) => {
 
   try {
     const googleUrl = `https://www.googleapis.com/books/v1/volumes?q=${encodeURIComponent(q)}&maxResults=8&country=BR`;
-    const googleResp = await fetch(googleUrl);
-    const googleData = await googleResp.json();
-
     let results = [];
 
-    if (googleData.items && googleData.items.length > 0) {
-      results = googleData.items.map(item => {
-        const info = item.volumeInfo || {};
-        const cover = info.imageLinks
-          ? (info.imageLinks.thumbnail || info.imageLinks.smallThumbnail || '').replace('http://', 'https://')
-          : null;
+    try {
+      const googleResp = await fetch(googleUrl);
+      console.log(`[busca-externa] Google Books status: ${googleResp.status} para query "${q}"`);
 
-        const isbnInfo = (info.industryIdentifiers || []).find(i => i.type === 'ISBN_13')
-          || (info.industryIdentifiers || []).find(i => i.type === 'ISBN_10');
+      if (googleResp.ok) {
+        const googleData = await googleResp.json();
 
-        return {
-          source: 'google_books',
-          isbn: isbnInfo ? isbnInfo.identifier : null,
-          title: info.title || '',
-          author: (info.authors || []).join(', '),
-          publisher: info.publisher || '',
-          category: (info.categories || [])[0] || '',
-          synopsis: info.description || '',
-          cover_url: cover,
-          year: info.publishedDate ? info.publishedDate.substring(0, 4) : ''
-        };
-      }).filter(b => b.title);
+        if (googleData.items && googleData.items.length > 0) {
+          results = googleData.items.map(item => {
+            const info = item.volumeInfo || {};
+            const cover = info.imageLinks
+              ? (info.imageLinks.thumbnail || info.imageLinks.smallThumbnail || '').replace('http://', 'https://')
+              : null;
+
+            const isbnInfo = (info.industryIdentifiers || []).find(i => i.type === 'ISBN_13')
+              || (info.industryIdentifiers || []).find(i => i.type === 'ISBN_10');
+
+            return {
+              source: 'google_books',
+              isbn: isbnInfo ? isbnInfo.identifier : null,
+              title: info.title || '',
+              author: (info.authors || []).join(', '),
+              publisher: info.publisher || '',
+              category: (info.categories || [])[0] || '',
+              synopsis: info.description || '',
+              cover_url: cover,
+              year: info.publishedDate ? info.publishedDate.substring(0, 4) : ''
+            };
+          }).filter(b => b.title);
+        }
+      } else {
+        const errorBody = await googleResp.text();
+        console.error(`[busca-externa] Google Books falhou: ${googleResp.status} - ${errorBody.substring(0, 300)}`);
+      }
+    } catch (googleErr) {
+      console.error('[busca-externa] Erro de rede no Google Books:', googleErr.message);
     }
 
     // Fallback: se Google Books não retornou nada, tenta Open Library
     if (results.length === 0) {
-      const olUrl = `https://openlibrary.org/search.json?q=${encodeURIComponent(q)}&limit=8`;
-      const olResp = await fetch(olUrl);
-      const olData = await olResp.json();
+      try {
+        const olUrl = `https://openlibrary.org/search.json?q=${encodeURIComponent(q)}&limit=8`;
+        const olResp = await fetch(olUrl);
+        console.log(`[busca-externa] Open Library status: ${olResp.status} para query "${q}"`);
 
-      results = (olData.docs || []).map(doc => ({
-        source: 'open_library',
-        isbn: (doc.isbn || [])[0] || null,
-        title: doc.title || '',
-        author: (doc.author_name || []).join(', '),
-        publisher: (doc.publisher || [])[0] || '',
-        category: (doc.subject || [])[0] || '',
-        synopsis: '',
-        cover_url: doc.cover_i ? `https://covers.openlibrary.org/b/id/${doc.cover_i}-L.jpg` : null,
-        year: doc.first_publish_year ? String(doc.first_publish_year) : ''
-      })).filter(b => b.title);
+        if (olResp.ok) {
+          const olData = await olResp.json();
+
+          results = (olData.docs || []).map(doc => ({
+            source: 'open_library',
+            isbn: (doc.isbn || [])[0] || null,
+            title: doc.title || '',
+            author: (doc.author_name || []).join(', '),
+            publisher: (doc.publisher || [])[0] || '',
+            category: (doc.subject || [])[0] || '',
+            synopsis: '',
+            cover_url: doc.cover_i ? `https://covers.openlibrary.org/b/id/${doc.cover_i}-L.jpg` : null,
+            year: doc.first_publish_year ? String(doc.first_publish_year) : ''
+          })).filter(b => b.title);
+        } else {
+          const errorBody = await olResp.text();
+          console.error(`[busca-externa] Open Library falhou: ${olResp.status} - ${errorBody.substring(0, 300)}`);
+        }
+      } catch (olErr) {
+        console.error('[busca-externa] Erro de rede no Open Library:', olErr.message);
+      }
     }
 
     res.json({ results });
   } catch (err) {
-    console.error('Erro na busca externa:', err);
+    console.error('[busca-externa] Erro inesperado:', err);
     res.status(500).json({ error: 'Erro ao buscar livro na internet' });
   }
 });
@@ -444,6 +466,41 @@ app.put('/api/books/:id', authenticateToken, (req, res) => {
       res.json({ message: 'Livro atualizado' });
     }
   );
+});
+
+// Ajuste manual de quantidade em estoque (define um novo valor absoluto, não soma)
+app.put('/api/books/:id/adjust-stock', authenticateToken, (req, res) => {
+  if (req.user.role !== 'admin' && req.user.role !== 'gerente') {
+    return res.status(403).json({ error: 'Acesso negado' });
+  }
+
+  const newQuantity = parseInt(req.body.quantity);
+  if (isNaN(newQuantity) || newQuantity < 0) {
+    return res.status(400).json({ error: 'Quantidade inválida' });
+  }
+
+  db.get(`SELECT quantity FROM books WHERE id = ?`, [req.params.id], (err, book) => {
+    if (err || !book) return res.status(404).json({ error: 'Livro não encontrado' });
+
+    const oldQuantity = book.quantity;
+    const diff = newQuantity - oldQuantity;
+
+    db.run(
+      `UPDATE books SET quantity = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?`,
+      [newQuantity, req.params.id],
+      function(err) {
+        if (err) return res.status(500).json({ error: err.message });
+
+        db.run(
+          `INSERT INTO inventory_logs (book_id, type, quantity, reason, user_id) VALUES (?, ?, ?, ?, ?)`,
+          [req.params.id, diff >= 0 ? 'ajuste_entrada' : 'ajuste_saida', Math.abs(diff), 'Ajuste manual de estoque', req.user.id]
+        );
+
+        logAudit(req.user.id, 'AJUSTAR_ESTOQUE', 'books', req.params.id, { quantity: oldQuantity }, { quantity: newQuantity }, req.ip);
+        res.json({ message: 'Estoque ajustado', oldQuantity, newQuantity });
+      }
+    );
+  });
 });
 
 // ============= ROTAS DE VENDAS =============
