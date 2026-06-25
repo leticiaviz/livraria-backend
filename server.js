@@ -181,11 +181,14 @@ function seedDefaultUsers() {
 // Cria alguns livros de exemplo se o estoque estiver vazio
 function seedSampleBooks() {
   const sampleBooks = [
-    ['978-8535902778', 'Memórias Póstumas de Brás Cubas', 'Machado de Assis', 'Clássico', 15, 5, 49.90],
-    ['978-8595084741', '1984', 'George Orwell', 'Ficção Científica', 20, 5, 59.90],
-    ['978-8595087925', 'O Hobbit', 'J.R.R. Tolkien', 'Fantasia', 18, 5, 64.90],
-    ['978-8576570904', 'Harry Potter e a Pedra Filosofal', 'J.K. Rowling', 'Fantasia', 25, 10, 69.90],
-    ['978-8547000357', 'O Alquimista', 'Paulo Coelho', 'Inspiração', 30, 10, 39.90]
+    ['978-8531109461', 'Bíblia de Estudo NVI', 'Sociedade Bíblica Internacional', 'Bíblias', 20, 8, 89.90],
+    ['978-8543303877', 'O Propósito de Você Estar Aqui', 'Rick Warren', 'Autoajuda Cristã', 15, 5, 54.90],
+    ['978-8575600073', 'Em Seus Passos: Que Faria Jesus?', 'Charles Sheldon', 'Romance Cristão', 12, 5, 44.90],
+    ['978-8598655178', 'Mero Cristianismo', 'C.S. Lewis', 'Apologética', 18, 5, 49.90],
+    ['978-8543300609', 'O Maior Vendedor do Mundo', 'Og Mandino', 'Autoajuda Cristã', 10, 5, 39.90],
+    ['978-8598655055', 'As Crônicas de Nárnia', 'C.S. Lewis', 'Infantil Cristão', 22, 8, 79.90],
+    ['978-8575608376', 'Caminhando na Direção Certa', 'Max Lucado', 'Devocionais', 14, 5, 42.90],
+    ['978-8543301378', 'A Cabana', 'William P. Young', 'Romance Cristão', 16, 5, 47.90]
   ];
 
   db.get(`SELECT COUNT(*) as count FROM books`, (err, row) => {
@@ -204,7 +207,7 @@ function seedSampleBooks() {
         }
       );
     });
-    console.log('✅ Livros de exemplo criados');
+    console.log('✅ Livros de exemplo (catálogo cristão) criados');
   });
 }
 
@@ -307,84 +310,145 @@ app.put('/api/users/:id', authenticateToken, (req, res) => {
 
 // ============= BUSCA DE LIVROS NA INTERNET =============
 
-// Busca livro por título/autor/ISBN no Google Books, com fallback no Open Library
+// Palavras-chave que indicam conteúdo cristão/evangélico, usadas para pontuar relevância
+const CHRISTIAN_SIGNAL_WORDS = [
+  'deus', 'jesus', 'cristo', 'cristã', 'cristão', 'cristãos', 'evangélic', 'bíblia', 'bíblic',
+  'igreja', 'fé', 'espírito santo', 'oração', 'devocional', 'teologia', 'ministério', 'pastor',
+  'apóstolo', 'profeta', 'salvação', 'graça', 'discipulado', 'louvor', 'adoração', 'reino de deus',
+  'evangelho', 'escritura', 'sagrada', 'santo', 'santidade', 'redenção', 'aliança', 'testemunho',
+  'missão', 'missionár', 'congregação', 'culto', 'liturgia', 'apologética', 'patrística'
+];
+
+// Editoras cristãs conhecidas no Brasil, usadas para reforçar a segunda busca
+const CHRISTIAN_PUBLISHERS_HINT = 'editora Vida OR Mundo Cristão OR Hagnos OR Vida Nova OR Thomas Nelson OR Atos OR Central Gospel';
+
+function scoreChristianRelevance(book) {
+  const text = `${book.title} ${book.author} ${book.publisher} ${book.category} ${book.synopsis}`.toLowerCase();
+  let score = 0;
+  for (const word of CHRISTIAN_SIGNAL_WORDS) {
+    if (text.includes(word)) score += 1;
+  }
+  return score;
+}
+
+// Busca no Google Books, retornando lista normalizada (ou vazia em caso de erro)
+async function searchGoogleBooks(query) {
+  try {
+    const apiKey = process.env.GOOGLE_BOOKS_API_KEY;
+    const keyParam = apiKey ? `&key=${apiKey}` : '';
+    const url = `https://www.googleapis.com/books/v1/volumes?q=${encodeURIComponent(query)}&maxResults=10&country=BR${keyParam}`;
+    const resp = await fetch(url);
+    console.log(`[busca-externa] Google Books status: ${resp.status} para query "${query}"`);
+
+    if (!resp.ok) {
+      const errorBody = await resp.text();
+      console.error(`[busca-externa] Google Books falhou: ${resp.status} - ${errorBody.substring(0, 300)}`);
+      return [];
+    }
+
+    const data = await resp.json();
+    if (!data.items || data.items.length === 0) return [];
+
+    return data.items.map(item => {
+      const info = item.volumeInfo || {};
+      const cover = info.imageLinks
+        ? (info.imageLinks.thumbnail || info.imageLinks.smallThumbnail || '').replace('http://', 'https://')
+        : null;
+
+      const isbnInfo = (info.industryIdentifiers || []).find(i => i.type === 'ISBN_13')
+        || (info.industryIdentifiers || []).find(i => i.type === 'ISBN_10');
+
+      return {
+        source: 'google_books',
+        isbn: isbnInfo ? isbnInfo.identifier : null,
+        title: info.title || '',
+        author: (info.authors || []).join(', '),
+        publisher: info.publisher || '',
+        category: (info.categories || [])[0] || '',
+        synopsis: info.description || '',
+        cover_url: cover,
+        year: info.publishedDate ? info.publishedDate.substring(0, 4) : ''
+      };
+    }).filter(b => b.title);
+  } catch (err) {
+    console.error('[busca-externa] Erro de rede no Google Books:', err.message);
+    return [];
+  }
+}
+
+// Busca no Open Library, retornando lista normalizada (ou vazia em caso de erro)
+async function searchOpenLibrary(query) {
+  try {
+    const url = `https://openlibrary.org/search.json?q=${encodeURIComponent(query)}&limit=10`;
+    const resp = await fetch(url);
+    console.log(`[busca-externa] Open Library status: ${resp.status} para query "${query}"`);
+
+    if (!resp.ok) {
+      const errorBody = await resp.text();
+      console.error(`[busca-externa] Open Library falhou: ${resp.status} - ${errorBody.substring(0, 300)}`);
+      return [];
+    }
+
+    const data = await resp.json();
+    return (data.docs || []).map(doc => ({
+      source: 'open_library',
+      isbn: (doc.isbn || [])[0] || null,
+      title: doc.title || '',
+      author: (doc.author_name || []).join(', '),
+      publisher: (doc.publisher || [])[0] || '',
+      category: (doc.subject || [])[0] || '',
+      synopsis: '',
+      cover_url: doc.cover_i ? `https://covers.openlibrary.org/b/id/${doc.cover_i}-L.jpg` : null,
+      year: doc.first_publish_year ? String(doc.first_publish_year) : ''
+    })).filter(b => b.title);
+  } catch (err) {
+    console.error('[busca-externa] Erro de rede no Open Library:', err.message);
+    return [];
+  }
+}
+
+// Busca livro por título/autor/ISBN no Google Books, com fallback no Open Library.
+// Quando christian=true, reforça a busca com sinais do nicho cristão/evangélico e
+// reordena os resultados priorizando os mais relevantes para esse contexto.
 app.get('/api/books-search/external', authenticateToken, async (req, res) => {
   const q = (req.query.q || '').trim();
+  const christianFocus = req.query.christian === 'true';
+
   if (!q) return res.status(400).json({ error: 'Informe um termo de busca' });
 
   try {
-    const googleUrl = `https://www.googleapis.com/books/v1/volumes?q=${encodeURIComponent(q)}&maxResults=8&country=BR`;
-    let results = [];
+    let results = await searchGoogleBooks(q);
 
-    try {
-      const googleResp = await fetch(googleUrl);
-      console.log(`[busca-externa] Google Books status: ${googleResp.status} para query "${q}"`);
+    // Busca reforçada complementar, focada no nicho cristão (em paralelo conceitual, mas aqui sequencial por simplicidade)
+    if (christianFocus) {
+      const reinforcedQuery = `${q} cristão OR evangélico OR ${CHRISTIAN_PUBLISHERS_HINT}`;
+      const extra = await searchGoogleBooks(reinforcedQuery);
 
-      if (googleResp.ok) {
-        const googleData = await googleResp.json();
-
-        if (googleData.items && googleData.items.length > 0) {
-          results = googleData.items.map(item => {
-            const info = item.volumeInfo || {};
-            const cover = info.imageLinks
-              ? (info.imageLinks.thumbnail || info.imageLinks.smallThumbnail || '').replace('http://', 'https://')
-              : null;
-
-            const isbnInfo = (info.industryIdentifiers || []).find(i => i.type === 'ISBN_13')
-              || (info.industryIdentifiers || []).find(i => i.type === 'ISBN_10');
-
-            return {
-              source: 'google_books',
-              isbn: isbnInfo ? isbnInfo.identifier : null,
-              title: info.title || '',
-              author: (info.authors || []).join(', '),
-              publisher: info.publisher || '',
-              category: (info.categories || [])[0] || '',
-              synopsis: info.description || '',
-              cover_url: cover,
-              year: info.publishedDate ? info.publishedDate.substring(0, 4) : ''
-            };
-          }).filter(b => b.title);
+      // Junta sem duplicar (por título+autor)
+      const seen = new Set(results.map(b => `${b.title}|${b.author}`.toLowerCase()));
+      for (const book of extra) {
+        const key = `${book.title}|${book.author}`.toLowerCase();
+        if (!seen.has(key)) {
+          results.push(book);
+          seen.add(key);
         }
-      } else {
-        const errorBody = await googleResp.text();
-        console.error(`[busca-externa] Google Books falhou: ${googleResp.status} - ${errorBody.substring(0, 300)}`);
       }
-    } catch (googleErr) {
-      console.error('[busca-externa] Erro de rede no Google Books:', googleErr.message);
     }
 
-    // Fallback: se Google Books não retornou nada, tenta Open Library
+    // Fallback: se nada foi encontrado, tenta Open Library
     if (results.length === 0) {
-      try {
-        const olUrl = `https://openlibrary.org/search.json?q=${encodeURIComponent(q)}&limit=8`;
-        const olResp = await fetch(olUrl);
-        console.log(`[busca-externa] Open Library status: ${olResp.status} para query "${q}"`);
-
-        if (olResp.ok) {
-          const olData = await olResp.json();
-
-          results = (olData.docs || []).map(doc => ({
-            source: 'open_library',
-            isbn: (doc.isbn || [])[0] || null,
-            title: doc.title || '',
-            author: (doc.author_name || []).join(', '),
-            publisher: (doc.publisher || [])[0] || '',
-            category: (doc.subject || [])[0] || '',
-            synopsis: '',
-            cover_url: doc.cover_i ? `https://covers.openlibrary.org/b/id/${doc.cover_i}-L.jpg` : null,
-            year: doc.first_publish_year ? String(doc.first_publish_year) : ''
-          })).filter(b => b.title);
-        } else {
-          const errorBody = await olResp.text();
-          console.error(`[busca-externa] Open Library falhou: ${olResp.status} - ${errorBody.substring(0, 300)}`);
-        }
-      } catch (olErr) {
-        console.error('[busca-externa] Erro de rede no Open Library:', olErr.message);
-      }
+      results = await searchOpenLibrary(q);
     }
 
-    res.json({ results });
+    // Reordena priorizando relevância cristã, se solicitado
+    if (christianFocus && results.length > 0) {
+      results = results
+        .map(book => ({ ...book, _score: scoreChristianRelevance(book) }))
+        .sort((a, b) => b._score - a._score)
+        .map(({ _score, ...book }) => book);
+    }
+
+    res.json({ results: results.slice(0, 10) });
   } catch (err) {
     console.error('[busca-externa] Erro inesperado:', err);
     res.status(500).json({ error: 'Erro ao buscar livro na internet' });
